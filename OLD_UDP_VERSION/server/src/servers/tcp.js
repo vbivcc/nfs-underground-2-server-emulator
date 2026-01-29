@@ -1,0 +1,2216 @@
+// ============================================================================
+// NFSU2 Server - TCP Game Server
+// Based on captured traffic from NFSOR server (ug2.nfsor.net)
+// 
+// Protocol flow (from capture):
+// 1. Client connects to port 20921 - SSL handshake
+// 2. After SSL, client connects to port 20923 - EA protocol
+// 3. EA Protocol: [4-byte CMD][4-byte STATUS][4-byte LEN][PAYLOAD]
+// 
+// Commands observed:
+// - AUTH: Authentication (PROD, VERS, PRES, USER, LKEY)
+// - EPGT: Endpoint Get (LRSC, ID) -> (ENAB, ID, ADDR)
+// - RGET: Roster Get (LRSC, LIST, PRES, PEND, ID) -> (SIZE, ID)
+// - ROST: Roster response
+// - PSET: Presence Set (SHOW, STAT, PROD)
+// - DISC: Disconnect
+// ============================================================================
+
+import net from 'net';
+import tls from 'tls';
+import fs from 'fs';
+import path from 'path';
+import { createLogger } from '../utils/logger.js';
+import config from '../config.js';
+import database from '../database/index.js';
+
+const log = createLogger('TCP');
+
+class TCPServer {
+    constructor(udpServer = null) {
+        this.sslServer = null;
+        this.gameServer = null;
+        this.clients = new Map();
+        this.games = new Map();       // Active games: gameId -> game object
+        this.nextClientId = 1;
+        this.nextGameId = 800;        // Start game IDs from 800 (like NFSOR)
+        this.udpServer = udpServer;   // Reference to UDP relay for game registration
+        
+        // Try to load SSL certs (optional)
+        this.sslOptions = null;
+        try {
+            const certPath = path.join(process.cwd(), 'certs');
+            if (fs.existsSync(path.join(certPath, 'server.key'))) {
+                this.sslOptions = {
+                    key: fs.readFileSync(path.join(certPath, 'server.key')),
+                    cert: fs.readFileSync(path.join(certPath, 'server.crt')),
+                    // Allow self-signed
+                    rejectUnauthorized: false,
+                };
+                log.info('SSL certificates loaded');
+            }
+        } catch (e) {
+            log.warn('No SSL certs found, SSL port will be disabled');
+        }
+    }
+
+    start() {
+        // Port layout (matching NFSOR ug2.nfsor.net):
+        // 20920 - Base port
+        // 20921 - SSL/TLS handshake for authentication  
+        // 20922 - Ping/keepalive
+        // 20923 - Main EA text protocol (AUTH, PSET, EPGT, RGET, DISC)
+        
+        const ports = config.ports;
+        
+        // Start main EA protocol server on port 20923 (EA Messenger)
+        this.gameServer = net.createServer((socket) => {
+            const localPort = socket.localPort;
+            log.info(`>>> NEW CONNECTION on port ${localPort} (EA Messenger) from ${socket.remoteAddress}:${socket.remotePort}`);
+            this._onGameConnection(socket);
+        });
+        this.gameServer.on('error', (err) => log.error(`Game server error (${ports.game}):`, err.message));
+        this.gameServer.listen(ports.game, '0.0.0.0', () => {
+            log.info(`EA Protocol server (EA Messenger) listening on port ${ports.game}`);
+        });
+
+        // Start SSL server on port 20921
+        if (this.sslOptions) {
+            this.sslServer = tls.createServer(this.sslOptions, (socket) => this._onSSLConnection(socket));
+            this.sslServer.on('error', (err) => log.error(`SSL server error (${ports.ssl}):`, err.message));
+            this.sslServer.listen(ports.ssl, '0.0.0.0', () => {
+                log.info(`SSL Auth server listening on port ${ports.ssl}`);
+            });
+        } else {
+            // Create plain TCP that handles custom EA SSL handshake
+            // From capture: client sends 0x801C0100... server responds with certificate
+            const sslHandshakeServer = net.createServer((socket) => this._onSSLHandshake(socket));
+            sslHandshakeServer.on('error', (err) => log.error(`SSL handshake server error (${ports.ssl}):`, err.message));
+            sslHandshakeServer.listen(ports.ssl, '0.0.0.0', () => {
+                log.info(`SSL Handshake server listening on port ${ports.ssl} (custom EA protocol)`);
+            });
+        }
+
+        // Ping/keepalive server on port 20922
+        const pingServer = net.createServer((socket) => this._onPingConnection(socket));
+        pingServer.on('error', (err) => {
+            if (err.code !== 'EADDRINUSE') log.error(`Ping server error (${ports.ping}):`, err.message);
+        });
+        pingServer.listen(ports.ping, '0.0.0.0', () => {
+            log.info(`Ping server listening on port ${ports.ping}`);
+        });
+
+        // Also listen on base port 20920
+        const baseServer = net.createServer((socket) => this._onGameConnection(socket));
+        baseServer.on('error', (err) => {
+            if (err.code !== 'EADDRINUSE') log.error(`Base server error (${ports.base}):`, err.message);
+        });
+        baseServer.listen(ports.base, '0.0.0.0', () => {
+            log.info(`Base server listening on port ${ports.base}`);
+        });
+
+        return this;
+    }
+
+    stop() {
+        this.sslServer?.close();
+        this.gameServer?.close();
+        log.info('TCP servers stopped');
+    }
+
+    _onSSLConnection(socket) {
+        const clientId = this.nextClientId++;
+        const addr = socket.remoteAddress?.replace('::ffff:', '') || 'unknown';
+        log.info(`[${clientId}] SSL connection from ${addr}`);
+        
+        // SSL is just for authentication, then game switches to port+3
+        socket.on('data', (data) => {
+            log.info(`[${clientId}] SSL data: ${data.length} bytes`);
+        });
+        socket.on('close', () => {
+            log.info(`[${clientId}] SSL connection closed`);
+        });
+        socket.on('error', (err) => {
+            if (err.code !== 'ECONNRESET') {
+                log.error(`[${clientId}] SSL error: ${err.message}`);
+            }
+        });
+    }
+
+    _onSSLHandshake(socket) {
+        // Handle EA's custom SSL-like handshake without real TLS
+        // From capture: client sends 0x801C0100... 
+        // Server responds with certificate data (0x833E0400 + X.509 cert)
+        //
+        // HOWEVER: When client has SSL disabled by patches, it will send
+        // @tic/@dir directly (starts with 0x40 '@') instead of SSL hello!
+        // In that case, we treat this as a regular game connection.
+        
+        const clientId = this.nextClientId++;
+        const addr = socket.remoteAddress?.replace('::ffff:', '') || 'unknown';
+        log.info(`[${clientId}] SSL Handshake connection from ${addr}`);
+        
+        let state = 'WAIT_HELLO';  // WAIT_HELLO -> WAIT_KEY_EXCHANGE -> ESTABLISHED
+        let client = null;  // Will be created if we switch to game mode
+        
+        socket.on('data', (data) => {
+            const hexStr = data.toString('hex').substring(0, 64);
+            
+            // Check if this looks like @tic/@dir (SSL was patched/disabled)
+            // '@' = 0x40, '@tic' = 40 74 69 63, '@dir' = 40 64 69 72
+            if (state === 'WAIT_HELLO' && data[0] === 0x40) {
+                log.info(`[${clientId}] Detected @tic/@dir instead of SSL - client has SSL disabled!`);
+                log.info(`[${clientId}] Switching to regular game connection mode`);
+                
+                // Create a game client and process this data
+                client = {
+                    id: clientId,
+                    socket: socket,
+                    address: addr,
+                    buffer: Buffer.alloc(0),
+                    authenticated: false,
+                    sessionId: null,
+                };
+                this.clients.set(clientId, client);
+                
+                // Process this data as game data
+                state = 'GAME_MODE';
+                client.buffer = Buffer.concat([client.buffer, data]);
+                this._onData(client, data);
+                return;
+            }
+            
+            // If we're in game mode, process as game data
+            if (state === 'GAME_MODE' && client) {
+                client.buffer = Buffer.concat([client.buffer, data]);
+                this._onData(client, data);
+                return;
+            }
+            
+            log.info(`[${clientId}] SSL Handshake <<< ${data.length} bytes (state=${state}): ${hexStr}...`);
+            
+            // Check for initial handshake (0x801C0100...)
+            if (state === 'WAIT_HELLO' && data.length >= 4 && data[0] === 0x80 && data[1] === 0x1C) {
+                log.info(`[${clientId}] Received EA SSL ClientHello`);
+                this._sendSSLCertificate(socket, clientId);
+                state = 'WAIT_KEY_EXCHANGE';
+            }
+            // Handle key exchange (0x808A...)
+            else if (state === 'WAIT_KEY_EXCHANGE' && data.length >= 4 && data[0] === 0x80 && data[1] === 0x8A) {
+                log.info(`[${clientId}] Received EA SSL key exchange (${data.length} bytes)`);
+                this._sendSSLKeyResponse(socket, clientId);
+                state = 'ESTABLISHED';
+            }
+            // Handle subsequent encrypted messages
+            else if (state === 'ESTABLISHED') {
+                log.info(`[${clientId}] SSL encrypted data: ${data.length} bytes`);
+                // Forward to game protocol handler or respond appropriately
+            }
+            else {
+                log.warn(`[${clientId}] Unexpected SSL data in state ${state}: ${hexStr}...`);
+            }
+        });
+        
+        socket.on('close', () => {
+            log.info(`[${clientId}] SSL Handshake connection closed`);
+            if (client) {
+                this.clients.delete(clientId);
+            }
+        });
+        
+        socket.on('error', (err) => {
+            if (err.code !== 'ECONNRESET') {
+                log.error(`[${clientId}] SSL Handshake error: ${err.message}`);
+            }
+        });
+    }
+
+    _sendSSLCertificate(socket, clientId) {
+        // EA's custom SSL certificate response
+        // From captured NFSOR traffic: 4-byte header + 828-byte X.509 certificate
+        // Header: 0x833E0400 where 0x033E = 830 (cert length + 2)
+        // Certificate: OTG3 Certificate Authority (Electronic Arts)
+        
+        try {
+            // Load certificate from file (captured from real NFSOR server)
+            const certPath = path.join(process.cwd(), 'certs', 'ea_ssl_certificate.bin');
+            let certificate;
+            
+            if (fs.existsSync(certPath)) {
+                certificate = fs.readFileSync(certPath);
+                log.info(`[${clientId}] Loaded SSL certificate from file (${certificate.length} bytes)`);
+            } else {
+                log.error(`[${clientId}] SSL certificate file not found: ${certPath}`);
+                log.error(`[${clientId}] Please capture certificate using CAPTURE_CERT_MODE=1`);
+                socket.destroy();
+                return;
+            }
+            
+            // Header: 0x83 0x3E 0x04 0x00 
+            // 0x833E in little-endian = certificate length + 2 (830 = 828 + 2)
+            const header = Buffer.from([0x83, 0x3E, 0x04, 0x00]);
+            
+            // Send header first, then certificate
+            socket.write(header);
+            socket.write(certificate);
+            log.info(`[${clientId}] >>> Sent SSL certificate response (${header.length + certificate.length} bytes)`);
+        } catch (err) {
+            log.error(`[${clientId}] Failed to send SSL cert: ${err.message}`);
+        }
+    }
+
+    _sendSSLKeyResponse(socket, clientId) {
+        // Response to key exchange from captured traffic
+        // After client sends 140 bytes (0x808A...), server responds with:
+        // 4 bytes header + 15 bytes data = 19 bytes total
+        // Then more encrypted exchanges follow
+        
+        // First response: 80 11 + 2 random bytes, then 15 bytes
+        // From capture: 80 11 E1 64 | 4F 1C 11 18 A9 67 29 E3 23 05 B8 C8 62 04 49
+        const response1 = Buffer.from([
+            0x80, 0x11, 0xE1, 0x64,  // Header
+            0x4F, 0x1C, 0x11, 0x18, 0xA9, 0x67, 0x29, 0xE3, 
+            0x23, 0x05, 0xB8, 0xC8, 0x62, 0x04, 0x49
+        ]);
+        
+        try {
+            socket.write(response1);
+            log.info(`[${clientId}] >>> Sent SSL key response 1 (${response1.length} bytes)`);
+        } catch (err) {
+            log.error(`[${clientId}] Failed to send SSL key response: ${err.message}`);
+        }
+    }
+
+    _onPingConnection(socket) {
+        // Port 20922 - Main FESL protocol port!
+        // After @tic/@dir on port 20921, client connects here for:
+        // ?tic (verify encryption), addr, skey, news, sele, auth, pers, etc.
+        const clientId = this.nextClientId++;
+        const addr = socket.remoteAddress?.replace('::ffff:', '') || 'unknown';
+        
+        const client = {
+            id: clientId,
+            socket: socket,
+            address: addr,
+            port: socket.remotePort || 0,
+            buffer: Buffer.alloc(0),
+            user: null,
+            persona: null,
+            session: null,
+            authenticated: false,
+            presence: 'CHAT',
+            requestId: 0,
+        };
+        
+        this.clients.set(clientId, client);
+        log.info(`[${clientId}] FESL connection from ${addr} (port 20922)`);
+        
+        socket.setKeepAlive(true, 30000);
+        socket.setNoDelay(true);
+        
+        socket.on('data', (data) => {
+            client.buffer = Buffer.concat([client.buffer, data]);
+            const hexStr = data.toString('hex').substring(0, 80);
+            const asciiStr = data.toString('latin1').replace(/[^\x20-\x7E]/g, '.').substring(0, 40);
+            log.info(`[${clientId}] <<< ${data.length} bytes: ${hexStr}`);
+            log.debug(`[${clientId}] ASCII: ${asciiStr}`);
+            
+            // Process accumulated buffer
+            this._processFeslBuffer(client);
+        });
+        
+        socket.on('close', () => {
+            log.info(`[${clientId}] FESL connection closed`);
+            this._onClose(client);
+        });
+        
+        socket.on('error', (err) => {
+            if (err.code !== 'ECONNRESET') {
+                log.error(`[${clientId}] FESL error: ${err.message}`);
+            }
+        });
+        
+        socket.setTimeout(300000);
+    }
+    
+    _processFeslBuffer(client) {
+        // Process fesl protocol buffer
+        // Commands: ?tic, addr, skey, news, sele, auth, pers, user, onln, gsea, etc.
+        
+        while (client.buffer.length >= 12) {
+            const cmdStr = client.buffer.slice(0, 4).toString('latin1');
+            
+            // Check for ?tic (encryption verification)
+            if (cmdStr === '?tic') {
+                const packetLen = client.buffer.readUInt32BE(8);
+                if (client.buffer.length < packetLen) break;
+                
+                log.info(`[${client.id}] ?tic received (${packetLen} bytes) - encryption verified`);
+                
+                // Send 0xFFFFFFFF/-1 ready signal
+                const readyPacket = Buffer.alloc(12);
+                readyPacket.writeUInt32BE(0xFFFFFFFF, 0);  // cmd = 0xFFFFFFFF
+                readyPacket.writeInt32BE(-1, 4);  // status = -1
+                readyPacket.writeUInt32BE(12, 8);  // length = 12
+                
+                client.socket.write(readyPacket);
+                log.info(`[${client.id}] >>> Ready signal (0xFFFFFFFF/-1)`);
+                
+                client.buffer = client.buffer.slice(packetLen);
+                client.encryptionVerified = true;
+                continue;
+            }
+            
+            // Check if this is a known fesl command
+            if (this._isFeslCommand(client.buffer)) {
+                this._processFeslProtocol(client);
+                return;  // _processFeslProtocol handles the buffer
+            }
+            
+            // Unknown command - skip 1 byte
+            log.warn(`[${client.id}] Unknown FESL data: ${cmdStr} (0x${client.buffer.slice(0, 4).toString('hex')})`);
+            client.buffer = client.buffer.slice(1);
+        }
+    }
+
+    _onGameConnection(socket) {
+        const clientId = this.nextClientId++;
+        
+        const client = {
+            id: clientId,
+            socket: socket,
+            address: socket.remoteAddress?.replace('::ffff:', '') || 'unknown',
+            port: socket.remotePort || 0,
+            buffer: Buffer.alloc(0),
+            user: null,
+            persona: null,
+            session: null,
+            authenticated: false,
+            presence: 'CHAT',
+            requestId: 0,
+        };
+
+        this.clients.set(clientId, client);
+        log.info(`[${clientId}] Game connection from ${client.address}:${client.port}`);
+
+        socket.setKeepAlive(true, 30000);
+        socket.setNoDelay(true);
+
+        socket.on('data', (data) => this._onData(client, data));
+        socket.on('close', () => this._onClose(client));
+        socket.on('error', (err) => {
+            if (err.code !== 'ECONNRESET') {
+                log.error(`[${clientId}] Error: ${err.message}`);
+            }
+        });
+        socket.on('timeout', () => {
+            log.warn(`[${clientId}] Timeout`);
+            socket.end();
+        });
+
+        socket.setTimeout(300000); // 5 min timeout
+    }
+
+    _onData(client, data) {
+        // Append to buffer
+        client.buffer = Buffer.concat([client.buffer, data]);
+        
+        // Log raw data
+        const hexStr = data.toString('hex').substring(0, 64);
+        log.info(`[${client.id}] <<< ${data.length} bytes: ${hexStr}...`);
+        
+        // Check for @tic/@dir text protocol (starts with '@')
+        if (client.buffer[0] === 0x40) { // '@' = 0x40
+            this._processTextProtocol(client);
+        } 
+        // Check for lowercase fesl protocol (addr, skey, news, etc)
+        else if (this._isFeslCommand(client.buffer)) {
+            this._processFeslProtocol(client);
+        }
+        else {
+            // Binary EA protocol
+            this._processBuffer(client);
+        }
+    }
+    
+    _isFeslCommand(buffer) {
+        // fesl commands: addr, skey, news, auth, acct, etc (lowercase or special, 4 chars)
+        if (buffer.length < 4) return false;
+        const cmd = buffer.slice(0, 4).toString('latin1');
+        const feslCommands = [
+            'addr', 'skey', 'news', 'auth', 'acct', 'pers', 'sele', 'user', 'onln',
+            'cper',  // create persona
+            'dper',  // delete persona
+            'sper',  // select persona (login with persona)
+            'llvl',  // lobby level
+            'gsea',  // game search
+            'gget',  // get game info
+            'glea',  // leave game
+            'gjoi',  // join game
+            'gset',  // set game flags (ready status)
+            'gsta',  // game start (host starts the race)
+            'gcre',  // create game
+            'usld',  // user load (stats)
+            'gpsc',  // get persona count?
+            'rank',  // ranking
+            'snap',  // snapshot?
+            'auxi',  // auxiliary data (car customization)
+            '~png',  // ping/keepalive
+            '+sst',  // stats update (push)
+        ];
+        return feslCommands.includes(cmd);
+    }
+    
+    _processFeslProtocol(client) {
+        // fesl protocol: cmd(4) + status(4 BE) + length(4 BE) + data
+        // Length includes the 12-byte header!
+        
+        while (client.buffer.length >= 12) {
+            const cmd = client.buffer.slice(0, 4).toString('latin1');
+            const status = client.buffer.readUInt32BE(4);
+            const packetLen = client.buffer.readUInt32BE(8);
+            
+            if (packetLen < 12 || packetLen > 65536) {
+                log.warn(`[${client.id}] fesl ${cmd}: invalid length ${packetLen}, skipping byte`);
+                client.buffer = client.buffer.slice(1);
+                continue;
+            }
+            
+            if (client.buffer.length < packetLen) {
+                log.debug(`[${client.id}] fesl ${cmd}: waiting for more data (have ${client.buffer.length}, need ${packetLen})`);
+                break;
+            }
+            
+            log.info(`[${client.id}] fesl '${cmd}' received (${packetLen} bytes, status=${status})`);
+            
+            // Extract data after header
+            const dataStr = client.buffer.slice(12, packetLen).toString('latin1');
+            
+            // Parse KEY=VALUE pairs
+            const fields = {};
+            const lines = dataStr.split('\n');
+            for (const line of lines) {
+                const eqIdx = line.indexOf('=');
+                if (eqIdx > 0) {
+                    const key = line.substring(0, eqIdx).replace(/\x00/g, '').trim();
+                    const value = line.substring(eqIdx + 1).replace(/\x00/g, '').trim();
+                    if (key) fields[key] = value;
+                }
+            }
+            
+            log.info(`[${client.id}] fesl '${cmd}' fields:`, fields);
+            
+            // Handle specific commands
+            switch (cmd) {
+                case 'addr':
+                    // Client reporting its address
+                    client.reportedAddr = fields.ADDR;
+                    client.reportedPort = fields.PORT;
+                    this._sendFeslResponse(client, 'addr', {});
+                    break;
+                    
+                case 'skey':
+                    // Session key from client
+                    client.sessionKey = fields.SKEY;
+                    this._sendFeslResponse(client, 'skey', {});
+                    break;
+                    
+                case 'news':
+                    // News request - NAME=7 means config/settings request
+                    // From captured real NFSOR traffic, this returns HUGE config with tier points!
+                    const newsId = (fields.NAME || '0').replace(/\x00/g, '').trim();
+                    log.info(`[${client.id}] News request ID: '${newsId}'`);
+                    
+                    // Send full news/config response like real NFSOR server
+                    // NOTE: Status must be 'news7' (0x6E657737) for ID=7!
+                    this._sendFeslResponseWithStatus(client, 'news', 0x6E657737, {
+                        'TOSURL': 'http://127.0.0.1/nfsu2/tos',
+                        'CIRCUIT_TIER_POINTS': '0,1999,4999,9999,19999,39999,59999,79999,99999,119999',
+                        'DRAG_TIER_POINTS': '0,1999,4999,9999,19999,39999,59999,79999,99999,119999',
+                        'URL_TIER_POINTS': '0,1999,4999,9999,19999,39999,59999,79999,99999,119999',
+                        'BUDDY_SERVER': '127.0.0.1',
+                        'BUDDY_PORT': '20923',
+                        'STREET_CROSS_TIER_POINTS': '0,1999,4999,9999,19999,39999,59999,79999,99999,119999',
+                        'NEWSURL': 'http://127.0.0.1/nfsu2/news',
+                        'SPRINT_TIER_POINTS': '0,1999,4999,9999,19999,39999,59999,79999,99999,119999',
+                        'DRIFT_TIER_POINTS': '0,1999,4999,9999,19999,39999,59999,79999,99999,119999',
+                    });
+                    break;
+                    
+                case 'sele':
+                    // Select - game mode selection, stats request
+                    // CLIENT: MYGAME=1, STATS=5000, ASYNC=1, MESGS=1
+                    // SERVER from NFSOR: ROOMS=1, SLOTS=32, USERSET=1, MORE=1, MYGAME=1, RANKS=1, GAMES=2, ASYNC=1, STATS=500, MESGS=1, USERS=5
+                    client.gameMode = fields.MYGAME;
+                    client.wantsMessenger = fields.MESGS === '1';
+                    
+                    log.info(`[${client.id}] SELE: MYGAME=${fields.MYGAME}, STATS=${fields.STATS}, MESGS=${fields.MESGS}`);
+                    
+                    // Send sele response EXACTLY like NFSOR!
+                    this._sendFeslResponse(client, 'sele', {
+                        'ROOMS': '1',      // Number of rooms/lobbies
+                        'SLOTS': '32',     // Max slots per game
+                        'USERSET': '1',    // User settings enabled
+                        'MORE': '1',       // More data available
+                        'MYGAME': fields.MYGAME || '1',  // Echo back MYGAME
+                        'RANKS': '1',      // Rankings enabled
+                        'GAMES': '2',      // Number of active games (can be dynamic)
+                        'ASYNC': fields.ASYNC || '1',   // Async mode
+                        'STATS': '500',    // Stats limit
+                        'MESGS': fields.MESGS || '1',   // Messenger enabled
+                        'USERS': String(this.clients.size),  // Online users count
+                    });
+                    break;
+                    
+                case 'auth':
+                    // Authentication/login (after acct created)
+                    this._handleFeslAuth(client, fields);
+                    break;
+                    
+                case 'acct':
+                    // Account creation/registration request
+                    // Fields: REGN, CLST, NETV, FROM, LANG, MID, PROD, VERS, SLUS, SKU, 
+                    //         NAME, PASS, MAIL, BORN, GEND, SPAM, TOS, MASK
+                    this._handleAcct(client, fields);
+                    break;
+                    
+                case 'pers':
+                    // Persona selection/login - this is the final step before EA Messenger!
+                    // After pers, client will disconnect and reconnect to port 20923
+                    const persona = fields.PERS || fields.NAME || 'Player';
+                    client.persona = persona;
+                    
+                    // Generate 32-char hex LKEY (must match what client sends to EA Messenger)
+                    const lkeyHex = [...Array(32)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
+                    client.lkey = lkeyHex;
+                    
+                    // Store session for EA Messenger auth
+                    if (client.user) {
+                        database.updateSession(client.session?.odId, {
+                            lkey: lkeyHex,
+                            persona: persona,
+                        });
+                    }
+                    
+                    log.info(`[${client.id}] PERS: Persona '${persona}' selected, LKEY=${lkeyHex.substring(0,8)}...`);
+                    log.info(`[${client.id}] PERS: Client should now connect to BUDDY_SERVER:BUDDY_PORT for EA Messenger`);
+                    
+                    // Send pers response - match REAL NFSOR protocol exactly!
+                    // From captured traffic, pers response contains:
+                    // LKEY, PERS, LAST, PLAST, NAME (NO ADDR/PORT - client uses BUDDY_* from conf!)
+                    this._sendFeslResponse(client, 'pers', {
+                        'LKEY': lkeyHex,  // 32-char hex key for EA Messenger auth
+                        'PERS': persona,
+                        'LAST': '2006.12.8 15:51:58',  // Last login time
+                        'PLAST': '2006.12.8 16:51:40', // Last persona use time
+                        'NAME': client.user?.name || persona,  // Account name
+                    });
+                    
+                    // Send stats update after persona selection (like NFSOR does)
+                    setTimeout(() => {
+                        this._sendStatsUpdate(client);
+                    }, 100);
+                    break;
+                    
+                case 'onln':
+                    // Check if persona is online
+                    // CLIENT: PERS=<persona_name>
+                    // SERVER: I=0 (not online) or I=<id> (online)
+                    this._handleOnlineCheck(client, fields);
+                    break;
+                    
+                case 'gsta':
+                    // Game start - host signals to start the race
+                    // CLIENT: NAME=069.usersssss
+                    // SERVER: empty response, then +ses to all players
+                    this._handleGameStart(client, fields);
+                    break;
+                    
+                case 'user':
+                    // User info request (NOT auth!)
+                    // CLIENT: PERS=test
+                    // SERVER: LMSTAT=, STAT=0,0,0,0,..., LGAME=
+                    this._handleUserInfo(client, fields);
+                    break;
+                    
+                case 'llvl':
+                    // Lobby level
+                    this._sendFeslResponse(client, 'llvl', {
+                        'LLVL': '1',
+                    });
+                    break;
+                    
+                case 'gsea':
+                    // Game search
+                    // CLIENT: START=0, COUNT=20, CUSTFLAGS=67109107, CUSTMASK=67109363, SYSFLAGS=0, SYSMASK=786432
+                    // SERVER: COUNT=N + multiple +gam pushes for each game
+                    this._handleGameSearch(client, fields);
+                    break;
+                    
+                case 'gget':
+                    // Get game info by name
+                    this._handleGameGet(client, fields);
+                    break;
+                    
+                case 'gjoi':
+                    // Join game
+                    // CLIENT: NAME=292.vpotoke
+                    // SERVER: Full game info + player info via +who and +mgm
+                    this._handleGameJoin(client, fields);
+                    break;
+                    
+                case 'gset':
+                    // Set game flags (player ready status, etc.)
+                    // CLIENT: NAME=292.vpotoke, USERFLAGS=0 (or 134217728 for ready)
+                    this._handleGameSet(client, fields);
+                    break;
+                    
+                case 'glea':
+                    // Leave game
+                    this._handleGameLeave(client, fields);
+                    break;
+                    
+                case 'gcre':
+                    // Create game
+                    this._handleGameCreate(client, fields);
+                    break;
+                    
+                case 'auxi':
+                    // Auxiliary data (car customization data)
+                    // CLIENT: TEXT=<base64 encoded car data>
+                    this._handleAuxi(client, fields);
+                    break;
+                    
+                case 'usld':
+                    // User load (stats)
+                    this._sendFeslResponse(client, 'usld', {});
+                    break;
+                    
+                case 'gpsc':
+                    // Get persona?
+                    this._sendFeslResponse(client, 'gpsc', {
+                        'COUNT': '0',
+                    });
+                    break;
+                    
+                case 'cper':
+                    // Create persona - PERS=<persona_name>
+                    this._handleCreatePersona(client, fields);
+                    break;
+                    
+                case 'dper':
+                    // Delete persona
+                    this._sendFeslResponse(client, 'dper', {});
+                    break;
+                    
+                case 'sper':
+                    // Select persona (login with persona)
+                    this._handleSelectPersona(client, fields);
+                    break;
+                    
+                case 'rank':
+                    // Ranking request
+                    this._sendFeslResponse(client, 'rank', {
+                        'RANK': '1',
+                        'SCORE': '0',
+                    });
+                    break;
+                    
+                case 'snap':
+                    // Snapshot/stats
+                    this._sendFeslResponse(client, 'snap', {});
+                    break;
+                    
+                case '~png':
+                    // Ping/keepalive
+                    // CLIENT: REF=2026-01-25, TIME=187
+                    // SERVER: REF=2026-01-25 (echo back)
+                    const pingRef = fields.REF || new Date().toISOString().split('T')[0];
+                    this._sendFeslResponse(client, '~png', { 'REF': pingRef });
+                    break;
+                    
+                case '+sst':
+                    // Stats update (server pushes this, but client might echo)
+                    // Ignore or log
+                    log.debug(`[${client.id}] +sst received (stats update)`);
+                    break;
+                    
+                default:
+                    log.warn(`[${client.id}] Unhandled fesl command: ${cmd}`);
+                    this._sendFeslResponse(client, cmd, {});
+            }
+            
+            // Remove processed packet
+            client.buffer = client.buffer.slice(packetLen);
+        }
+    }
+    
+    _sendFeslResponse(client, cmd, fields) {
+        this._sendFeslResponseWithStatus(client, cmd, 0, fields);
+    }
+    
+    _sendFeslResponseWithStatus(client, cmd, status, fields) {
+        // Build response in EA text protocol format:
+        // [4 bytes cmd][4 bytes status][4 bytes total_length][payload]
+        // Total length includes the 12-byte header
+        let data = '';
+        for (const [key, value] of Object.entries(fields)) {
+            data += `${key}=${value}\n`;
+        }
+        
+        const body = Buffer.from(data, 'latin1');
+        const totalLen = 12 + body.length;  // header(12) + payload
+        
+        const packet = Buffer.alloc(totalLen);
+        // Command (4 bytes)
+        packet.write(cmd.substring(0, 4).padEnd(4, '\0'), 0, 'latin1');
+        // Status (4 bytes)
+        packet.writeUInt32BE(status, 4);
+        // Length (4 bytes) - total packet length including header
+        packet.writeUInt32BE(totalLen, 8);
+        // Payload
+        body.copy(packet, 12);
+        
+        try {
+            client.socket.write(packet);
+            log.info(`[${client.id}] >>> fesl '${cmd}' response (${packet.length} bytes)`);
+            log.debug(`[${client.id}] fesl '${cmd}' body: ${data.replace(/\n/g, ', ').slice(0, 100)}`);
+        } catch (err) {
+            log.error(`[${client.id}] Failed to send fesl response: ${err.message}`);
+        }
+    }
+    
+    _handleAcct(client, fields) {
+        // Account creation/registration request
+        // Fields: NAME, PASS, MAIL, BORN, GEND, TOS, etc.
+        const name = fields.NAME || '';
+        const pass = fields.PASS || '';
+        const mail = fields.MAIL || '';
+        const tos = parseInt(fields.TOS) || 0;
+        const prod = fields.PROD || 'nfs-pc-2005';
+        
+        log.info(`[${client.id}] ACCT: Creating account for name=${name} mail=${mail} tos=${tos}`);
+        
+        // Store TOS acceptance and user info in client
+        client.tosAccepted = (tos >= 1);
+        client.userName = name;
+        client.userPass = pass;
+        client.userMail = mail;
+        client.product = prod;
+        
+        if (!client.tosAccepted) {
+            log.warn(`[${client.id}] ACCT: TOS not accepted in acct request`);
+        }
+        
+        // Try to get or create user in database
+        let dbUser = database.getUser(name);
+        if (!dbUser) {
+            const result = database.createUser(name, pass, mail);
+            if (result.success) {
+                dbUser = result.user;
+                log.info(`[${client.id}] ACCT: New user registered: ${name}`);
+                // Don't auto-create persona - player will create via 'cper' command
+            } else {
+                log.warn(`[${client.id}] ACCT: Failed to create user: ${result.error}`);
+            }
+        }
+        
+        client.user = dbUser || { name: name, id: Date.now(), personas: [] };
+        
+        // Generate session/persona key
+        const lkey = '$' + Math.random().toString(16).slice(2, 14);
+        client.lkey = lkey;
+        
+        // Get personas list - for NEW accounts this should be EMPTY!
+        // From capture: PERSONAS= (empty) when account is new
+        // After creating persona via 'cper', it becomes PERSONAS=usersssss,
+        const personas = dbUser?.personas || [];
+        
+        // If account was just created (no personas yet), return empty
+        // Otherwise return comma-separated list ending with comma
+        let personasList = '';
+        if (personas.length > 0) {
+            personasList = personas.join(',') + ',';
+        }
+        
+        // Calculate age from BORN field (YYYYMMDD)
+        let age = 20;  // default
+        const born = fields.BORN || '19800101';
+        if (born && born.length >= 4) {
+            const birthYear = parseInt(born.substring(0, 4));
+            const currentYear = new Date().getFullYear();
+            age = currentYear - birthYear;
+        }
+        
+        // Send success response - based on original NFSOR protocol
+        // From capture: PERSONAS=\nNAME=test123123\nAGE=20
+        this._sendFeslResponse(client, 'acct', {
+            'PERSONAS': personasList,  // Empty for new account, "name," for existing
+            'NAME': name,
+            'AGE': String(age),
+        });
+    }
+    
+    _handleFeslAuth(client, fields) {
+        // Authentication/login request (called after acct)
+        // Fields: REGN, CLST, NETV, FROM, LANG, MID, PROD, VERS, SLUS, SKU, NAME, PASS, PSES, MASK
+        const name = fields.NAME || client.userName || '';
+        const pass = fields.PASS || '';
+        const pses = fields.PSES || '';  // Previous session token
+        const prod = fields.PROD || client.product || 'nfs-pc-2005';
+        
+        log.info(`[${client.id}] AUTH: prod=${prod} name=${name} pses=${pses ? 'yes' : 'no'}`);
+        
+        // Check if user exists in database
+        let dbUser = database.getUser(name);
+        
+        if (dbUser) {
+            // User exists - validate (our validateUser always succeeds for now)
+            const result = database.validateUser(name, pass);
+            if (!result.success) {
+                // IMPORTANT: Invalid password returns STATUS=0x70617373 ("pass" in ASCII)
+                // This is what real NFSOR does!
+                log.warn(`[${client.id}] AUTH: Invalid password for ${name}`);
+                this._sendFeslResponseWithStatus(client, 'auth', 0x70617373, {});  // "pass"
+                return;
+            }
+            dbUser = result.user;
+            log.info(`[${client.id}] AUTH: User ${name} exists, logging in`);
+        } else {
+            // User doesn't exist
+            // If TOS was accepted in prior 'acct' call, create new account
+            // If not, this is a login attempt for non-existent user -> return error
+            if (client.tosAccepted) {
+                // TOS was accepted in 'acct' step, create user
+                const result = database.createUser(name, pass, client.userMail || '');
+                if (result.success) {
+                    dbUser = result.user;
+                    log.info(`[${client.id}] AUTH: Auto-created user: ${name}`);
+                } else {
+                    log.warn(`[${client.id}] AUTH: Failed to create user: ${result.error}`);
+                    this._sendFeslResponseWithStatus(client, 'auth', 0x70617373, {});
+                    return;
+                }
+            } else {
+                // No TOS acceptance -> user trying to login with wrong username
+                // Return "pass" error like NFSOR does
+                log.warn(`[${client.id}] AUTH: User '${name}' not found (no prior TOS acceptance)`);
+                this._sendFeslResponseWithStatus(client, 'auth', 0x70617373, {});  // "pass"
+                return;
+            }
+        }
+        
+        // Create session
+        const session = database.createSession(dbUser.id, {
+            addr: client.address,
+            port: client.port,
+            name: name,
+        });
+        
+        client.user = dbUser;
+        client.session = session;
+        client.authenticated = true;
+        client.persona = name;  // Default persona is same as username
+        
+        // Generate session key
+        const lkey = client.lkey || ('$' + Math.random().toString(16).slice(2, 14));
+        const addr = client.address || '127.0.0.1';
+        
+        // Get personas list
+        const personas = dbUser.personas || [];
+        const personasList = personas.length > 0 ? personas.join(',') + ',' : '';
+        
+        // Send success response - match real NFSOR format!
+        this._sendFeslResponse(client, 'auth', {
+            'MAIL': dbUser.mail || 'user@example.com',
+            'LAST': '2005.12.8 15:51:38',  // Last login time
+            'BORN': dbUser.born || '19800101',
+            'PERSONAS': personasList,  // Comma-separated list ending with comma
+            'TOS': '3',  // TOS version accepted
+            'NAME': name,
+            'SPAM': 'N',
+            'ADDR': addr,
+        });
+        
+        log.info(`[${client.id}] AUTH: Success! User ${name} authenticated`);
+        
+        // Send +who push with user stats (like real NFSOR)
+        setTimeout(() => {
+            this._sendFeslResponse(client, '+who', {
+                'A': addr,  // Address
+                'C': '20043',  // ?
+                'G': '0',  // Game ID (0 = not in game)
+                'I': String(client.id + 2485),  // User ID (OPID)
+                'CL': '423',
+                'LV': '354',
+                'M': name,  // Username (account)
+                'N': 'null', // Persona (null = not selected yet)
+                'HW': '5765',
+                'P': '100',
+                'WI': '10323',
+                'R': '11432',
+                'S': 'test',  // Server name
+                'AT': '1423',
+                'MA': '7876',
+                'LA': addr,  // Local address
+                'MD': '4654',
+                'X': 'null',  // Aux data (car)
+                'WT': '8987',
+                'RP': '676',
+                'US': '2',
+            });
+        }, 50);
+    }
+    
+    _sendStatsUpdate(client) {
+        // Send +sst stats update
+        // From NFSOR: GCM=0, UIG=0, GCR=1, UIL=8, UIR=0, GIP=0
+        this._sendFeslResponse(client, '+sst', {
+            'GCM': '0',  // Games completed?
+            'UIG': '0',  // Users in game?
+            'GCR': String(this.games.size),  // Games created/rooms
+            'UIL': String(this.clients.size),  // Users in lobby
+            'UIR': '0',  // Users in race?
+            'GIP': '0',  // Games in progress?
+        });
+    }
+    
+    _broadcastStatsUpdate() {
+        // Send +sst stats update to all connected clients
+        for (const client of this.clients.values()) {
+            if (client.authenticated) {
+                this._sendStatsUpdate(client);
+            }
+        }
+    }
+    
+    _handleUserInfo(client, fields) {
+        // User info request - return player statistics
+        // CLIENT: PERS=test
+        // SERVER from NFSOR: LMSTAT=, STAT=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,, LGAME=
+        const persona = fields.PERS || client.persona || 'Player';
+        
+        log.info(`[${client.id}] USER: Getting info for persona '${persona}'`);
+        
+        // Build 38-element stats array (all zeros for now)
+        const stats = new Array(38).fill('0').join(',') + ',';
+        
+        this._sendFeslResponse(client, 'user', {
+            'LMSTAT': '',     // Last match stat
+            'STAT': stats,    // 38 comma-separated values
+            'LGAME': '',      // Last game
+        });
+    }
+    
+    _handleCreatePersona(client, fields) {
+        // Create persona - PERS=<persona_name>
+        const personaName = fields.PERS || fields.NAME || '';
+        
+        log.info(`[${client.id}] CPER: Creating persona '${personaName}'`);
+        
+        if (!personaName || personaName.length < 3) {
+            log.warn(`[${client.id}] CPER: Invalid persona name`);
+            this._sendFeslResponse(client, 'cper', {
+                'ERR': 'misg',
+                'MSG': 'Persona name too short'
+            });
+            return;
+        }
+        
+        // Store persona on client
+        client.persona = personaName;
+        
+        // Add persona to user in database if we have one
+        if (client.user && client.user.id) {
+            // Try to add persona to database
+            const result = database.addPersona(client.user.id, personaName);
+            if (!result.success) {
+                log.warn(`[${client.id}] CPER: ${result.error}`);
+                // Continue anyway - persona might already exist
+            }
+        }
+        
+        // Send success response
+        // Based on captured traffic, response should include PERS and NAME
+        this._sendFeslResponse(client, 'cper', {
+            'PERS': personaName,
+            'NAME': personaName,
+        });
+        
+        log.info(`[${client.id}] CPER: Persona '${personaName}' created successfully`);
+    }
+    
+    _handleSelectPersona(client, fields) {
+        // Select/login with persona - PERS=<persona_name>
+        const personaName = fields.PERS || fields.NAME || client.persona || '';
+        
+        log.info(`[${client.id}] SPER: Selecting persona '${personaName}'`);
+        
+        client.persona = personaName;
+        
+        // Generate LKEY for this persona session
+        const lkey = '$' + Math.random().toString(16).slice(2, 14);
+        client.personaLkey = lkey;
+        
+        // Send success response
+        this._sendFeslResponse(client, 'sper', {
+            'PERS': personaName,
+            'LKEY': lkey,
+        });
+        
+        log.info(`[${client.id}] SPER: Persona '${personaName}' selected`);
+    }
+    
+    _processTextProtocol(client) {
+        // EA fesl/@tic/@dir/?tic protocol
+        // @tic: ticket/encryption negotiation (client -> server)
+        // @dir: directory service request
+        // ?tic: encryption verification (client -> server, after @dir response)
+        // Both can arrive in same TCP stream!
+        
+        while (client.buffer.length >= 12) {
+            const dataStr = client.buffer.toString('latin1');
+            
+            // Handle ?tic (encryption verification) - client sends 52 bytes back
+            if (dataStr.startsWith('?tic')) {
+                const packetLen = client.buffer.readUInt32BE(8);
+                if (client.buffer.length < packetLen) {
+                    log.debug(`[${client.id}] ?tic: waiting for more data (have ${client.buffer.length}, need ${packetLen})`);
+                    break;
+                }
+                
+                log.info(`[${client.id}] ?tic (verify) received (${packetLen} bytes) - encryption handshake complete`);
+                
+                // Extract verification data (after 12-byte header)
+                const verifyData = client.buffer.slice(12, packetLen);
+                log.debug(`[${client.id}] ?tic verify data hex: ${verifyData.toString('hex').substring(0, 64)}...`);
+                
+                // Client has verified encryption, mark as ready
+                client.encryptionVerified = true;
+                
+                // NFSOR responds with 0xFFFFFFFF/-1 status (connection ready)
+                // This signals that encryption is established
+                const readyPacket = Buffer.alloc(12);
+                readyPacket.write('\xFF\xFF\xFF\xFF', 0, 'latin1');  // cmd = 0xFFFFFFFF
+                readyPacket.writeInt32BE(-1, 4);  // status = -1
+                readyPacket.writeUInt32BE(12, 8);  // length = 12 (header only)
+                
+                try {
+                    client.socket.write(readyPacket);
+                    log.info(`[${client.id}] >>> Connection ready signal (0xFFFFFFFF/-1)`);
+                } catch (err) {
+                    log.error(`[${client.id}] Failed to send ready signal: ${err.message}`);
+                }
+                
+                // Remove processed packet
+                client.buffer = client.buffer.slice(packetLen);
+                continue;
+            }
+            
+            if (dataStr.startsWith('@tic')) {
+                // Get packet length from byte 11
+                const packetLen = client.buffer[11];
+                if (client.buffer.length < packetLen) {
+                    log.debug(`[${client.id}] @tic: waiting for more data (have ${client.buffer.length}, need ${packetLen})`);
+                    break;
+                }
+                
+                log.info(`[${client.id}] @tic (ticket) message received (${packetLen} bytes)`);
+                
+                // Extract algorithm (after @tic + 8 bytes header)
+                const algoStart = 12;
+                const algoEnd = dataStr.indexOf('\0', algoStart);
+                const algorithm = dataStr.substring(algoStart, algoEnd > 0 ? algoEnd : undefined);
+                log.info(`[${client.id}] Encryption algorithm: ${algorithm}`);
+                
+                client.algorithm = algorithm;
+                
+                // Send @tic response
+                this._sendTicResponse(client);
+                
+                // Remove processed packet from buffer
+                client.buffer = client.buffer.slice(packetLen);
+            }
+            else if (dataStr.startsWith('@dir')) {
+                // Get packet length from byte 11
+                const packetLen = client.buffer[11];
+                if (client.buffer.length < packetLen) {
+                    log.debug(`[${client.id}] @dir: waiting for more data (have ${client.buffer.length}, need ${packetLen})`);
+                    break;
+                }
+                
+                log.info(`[${client.id}] @dir (directory) message received (${packetLen} bytes)`);
+                
+                // Extract fields (after header)
+                const dataOffset = 12;
+                const fieldsStr = dataStr.substring(dataOffset, packetLen);
+                
+                // Parse KEY=VALUE pairs
+                const fields = {};
+                const lines = fieldsStr.split('\n');
+                for (const line of lines) {
+                    const eqIdx = line.indexOf('=');
+                    if (eqIdx > 0) {
+                        let key = line.substring(0, eqIdx).replace(/[^\x20-\x7E]/g, '').trim();
+                        const value = line.substring(eqIdx + 1).trim().replace(/"/g, '');
+                        if (key) fields[key] = value;
+                    }
+                }
+                
+                log.info(`[${client.id}] @dir fields:`, fields);
+                
+                client.product = fields.PROD || 'unknown';
+                client.version = fields.VERS || 'unknown';
+                client.region = fields.REGN || 'NA';
+                client.language = fields.LANG || 'EN';
+                client.machineId = fields.MID || '';
+                
+                // Send @dir response
+                this._sendDirResponse(client);
+                
+                // Remove processed packet from buffer
+                client.buffer = client.buffer.slice(packetLen);
+            }
+            else {
+                log.warn(`[${client.id}] Unknown @ protocol: ${dataStr.substring(0, 20)}`);
+                break;
+            }
+        }
+    }
+    
+    _sendTicResponse(client) {
+        // @tic response: send encryption key data
+        // From NFSOR capture: server responds with 43 bytes of key data
+        // Format: cmd(4) + status(4 BE) + length(4 BE) + key_data
+        //
+        // The key data is used for RC4+MD5 encryption negotiation
+        // Total packet = 12 (header) + 43 (data) = 55 bytes
+        
+        // Generate 43-byte key data (like NFSOR)
+        const keyData = Buffer.alloc(43);
+        for (let i = 0; i < 43; i++) {
+            keyData[i] = Math.floor(Math.random() * 256);
+        }
+        
+        // Store for later use
+        client.ticKey = keyData;
+        
+        // EA text protocol format
+        const totalLen = 12 + keyData.length;  // header(12) + key(43) = 55 bytes
+        
+        const packet = Buffer.alloc(totalLen);
+        packet.write('@tic', 0, 'latin1');
+        packet.writeUInt32BE(0, 4);  // status = 0
+        packet.writeUInt32BE(totalLen, 8);  // total length
+        keyData.copy(packet, 12);
+        
+        try {
+            client.socket.write(packet);
+            log.info(`[${client.id}] >>> @tic response (${packet.length} bytes): encryption key sent`);
+            log.debug(`[${client.id}] @tic key hex: ${keyData.toString('hex')}`);
+        } catch (err) {
+            log.error(`[${client.id}] Failed to send @tic response: ${err.message}`);
+        }
+    }
+    
+    _sendDirResponse(client) {
+        // Build @dir response
+        // Format: @dir(4) + status(4) + length(4) + data
+        // From NFSOR capture: PORT=20922, SESS=1651138085, ADDR=45.131.64.63, MASK=ed5faa76adec3f22520b6c90ec35acd4
+        
+        // Generate session ID (numeric, like NFSOR uses)
+        const sessionId = Math.floor(Date.now() / 1000);
+        client.sessionId = sessionId;
+        
+        // Generate MASK (32-char hex MD5-like hash)
+        const maskHash = [...Array(32)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
+        client.mask = maskHash;
+        
+        // Response fields - EXACTLY like real NFSOR!
+        // Note: PORT is ping port (20922), not base port
+        const response = [
+            'PORT=20922',                    // Ping port!
+            `SESS=${sessionId}`,             // Numeric session ID
+            'ADDR=127.0.0.1',                // Server IP (client will connect here)
+            `MASK=${maskHash}`,              // 32-char hex mask
+            ''
+        ].join('\n');
+        
+        const body = Buffer.from(response, 'latin1');
+        
+        // EA text protocol: cmd(4) + status(4 BE) + length(4 BE) + body
+        const totalLen = 12 + body.length;
+        
+        const packet = Buffer.alloc(totalLen);
+        packet.write('@dir', 0, 'latin1');
+        packet.writeUInt32BE(0, 4);  // status = 0
+        packet.writeUInt32BE(totalLen, 8);  // total length
+        body.copy(packet, 12);
+        
+        try {
+            client.socket.write(packet);
+            log.info(`[${client.id}] >>> @dir response (${packet.length} bytes)`);
+            log.info(`[${client.id}] @dir body: PORT=20922, SESS=${sessionId}, ADDR=127.0.0.1, MASK=${maskHash.substring(0,8)}...`);
+        } catch (err) {
+            log.error(`[${client.id}] Failed to send @dir response: ${err.message}`);
+        }
+    }
+
+    _processBuffer(client) {
+        // EA Protocol: [4-byte CMD ASCII][4-byte STATUS][4-byte LEN][PAYLOAD + \0]
+        // Length includes the 12-byte header
+        while (client.buffer.length >= 12) {
+            // Read command as 4 ASCII chars (not int)
+            const cmdBytes = client.buffer.slice(0, 4);
+            const cmd = cmdBytes.toString('ascii');
+            const status = client.buffer.readInt32BE(4);
+            const length = client.buffer.readUInt32BE(8);
+            
+            // Validate - check if this looks like a valid EA command
+            const isValidCmd = /^[A-Z]{4}$/.test(cmd);
+            
+            if (!isValidCmd) {
+                // Could be encrypted data or wrong offset
+                log.warn(`[${client.id}] Non-command packet: ${cmdBytes.toString('hex')} (not ASCII cmd)`);
+                // Skip one byte and try again
+                client.buffer = client.buffer.slice(1);
+                continue;
+            }
+            
+            // Validate length
+            if (length < 12 || length > 65536) {
+                log.warn(`[${client.id}] Invalid packet length: ${length} for cmd ${cmd}, skipping`);
+                client.buffer = client.buffer.slice(1);
+                continue;
+            }
+            
+            // Wait for complete packet
+            if (client.buffer.length < length) {
+                log.debug(`[${client.id}] Waiting for more data: have ${client.buffer.length}, need ${length}`);
+                break;
+            }
+            
+            // Extract payload (after 12-byte header, minus null terminator)
+            const payload = client.buffer.slice(12, length);
+            const payloadStr = payload.toString('utf8').replace(/\0+$/, ''); // Remove null terminators
+            
+            log.info(`[${client.id}] <<< CMD: ${cmd} status=${status} len=${length}`);
+            if (payloadStr.length > 0) {
+                log.info(`[${client.id}]     payload: ${payloadStr.replace(/\n/g, ' | ')}`);
+            }
+            
+            // Handle command
+            this._handleCommand(client, cmd, status, payloadStr);
+            
+            // Remove processed packet
+            client.buffer = client.buffer.slice(length);
+        }
+    }
+
+    _handleCommand(client, cmd, status, payload) {
+        const params = this._parsePayload(payload);
+        
+        switch (cmd) {
+            case 'AUTH':
+                this._handleAuth(client, params);
+                break;
+            case 'EPGT':
+                this._handleEPGT(client, params);
+                break;
+            case 'RGET':
+                this._handleRGET(client, params);
+                break;
+            case 'PSET':
+                this._handlePSET(client, params);
+                break;
+            case 'DISC':
+                this._handleDisc(client, params);
+                break;
+            case 'PING':
+                this._handlePing(client, params);
+                break;
+            case 'PADD':
+                // Add to buddy/presence list
+                this._handlePADD(client, params);
+                break;
+            case 'PGET':
+                // Get presence/status of user
+                this._handlePGET(client, params);
+                break;
+            default:
+                log.warn(`[${client.id}] Unknown command: ${cmd}`);
+                // Echo back with OK status
+                this._sendPacket(client, cmd, 0, '');
+        }
+    }
+
+    // ============================================================================
+    // Command Handlers (based on captured traffic)
+    // ============================================================================
+
+    _handleAuth(client, params) {
+        // EA Messenger AUTH has two formats:
+        // Format 1 (EA Messenger on port 20923): PROD=NFS-CONSOLE-2005\nVERS=0.1\nPRES=20920\nUSER=/PC/...\nLKEY=...
+        // Format 2 (fesl login): NAME=username\nPASS=password\nTOS=1\n...
+        // 
+        // Response for EA Messenger: TITL=EA MESSENGER (simple!)
+        
+        const prod = params.PROD || '';
+        const user = params.USER || '';
+        const lkey = params.LKEY || '';
+        const pres = params.PRES || '';  // Presence port
+        
+        // Check if this is EA Messenger AUTH (has PROD and USER and LKEY, no NAME/PASS)
+        if (prod && user && lkey && !params.NAME) {
+            log.info(`[${client.id}] EA MESSENGER AUTH: prod=${prod} user=${user} lkey=${lkey.substring(0,8)}...`);
+            
+            // This is EA Messenger connection on port 20923!
+            // Client already authenticated via fesl (pers), just validate LKEY
+            client.authenticated = true;
+            client.product = prod;
+            client.messengerUser = user;
+            client.lkey = lkey;
+            
+            // Simple response - just TITL=EA MESSENGER
+            // This is all the original NFSOR server responds with!
+            const response = 'TITL=EA MESSENGER\n';
+            this._sendPacket(client, 'AUTH', 0, response);
+            
+            log.info(`[${client.id}] EA MESSENGER: Client authenticated, ready for EPGT/RGET/PSET`);
+            return;
+        }
+        
+        // Check if this is NAME/PASS/TOS format (account creation/login via fesl)
+        const name = params.NAME || '';
+        const pass = params.PASS || '';
+        const tos = parseInt(params.TOS) || 0;
+        
+        log.info(`[${client.id}] AUTH: prod=${prod || 'N/A'} user=${user || 'N/A'} name=${name || 'N/A'}`);
+        
+        // If NAME/PASS/TOS provided, handle account creation/login
+        if (name && pass) {
+            // Check TOS agreement
+            if (tos < 1) {
+                log.warn(`[${client.id}] AUTH failed: TOS not accepted`);
+                const errorResponse = 'ERR=tosa\nMSG=Must accept Terms of Service\n';
+                this._sendPacket(client, 'AUTH', -1, errorResponse);
+                return;
+            }
+            
+            // Validate name
+            if (name.length < 3 || name.length > 16) {
+                log.warn(`[${client.id}] AUTH failed: Invalid username length`);
+                const errorResponse = 'ERR=misg\nMSG=Invalid username\n';
+                this._sendPacket(client, 'AUTH', -1, errorResponse);
+                return;
+            }
+            
+            // Try to login or register
+            let dbUser = database.getUser(name);
+            
+            if (!dbUser) {
+                // Auto-register new user
+                const result = database.createUser(name, pass);
+                if (!result.success) {
+                    log.warn(`[${client.id}] AUTH failed: ${result.error}`);
+                    const errorResponse = `ERR=dupl\nMSG=${result.error}\n`;
+                    this._sendPacket(client, 'AUTH', -1, errorResponse);
+                    return;
+                }
+                dbUser = result.user;
+                log.info(`[${client.id}] New user registered: ${name}`);
+            } else {
+                // Validate password
+                const result = database.validateUser(name, pass);
+                if (!result.success) {
+                    log.warn(`[${client.id}] AUTH failed: Invalid password`);
+                    const errorResponse = 'ERR=pass\nMSG=Invalid password\n';
+                    this._sendPacket(client, 'AUTH', -1, errorResponse);
+                    return;
+                }
+                dbUser = result.user;
+            }
+            
+            // Create session
+            const session = database.createSession(dbUser.id, {
+                addr: client.address,
+                port: client.port,
+                name: name,
+            });
+            
+            client.user = dbUser;
+            client.session = session;
+            client.authenticated = true;
+            
+            // Send success response with session info
+            const response = [
+                'TITL=EA MESSENGER',
+                `SESS=${session.odId}`,
+                `LKEY=${lkey || this._generateLKey()}`,
+                `NAME=${dbUser.name}`,
+                `ADDR=${client.address}`,
+                `PERSONAS=${dbUser.personas.length}`,
+            ].join('\n') + '\n';
+            
+            this._sendPacket(client, 'AUTH', 0, response);
+            return;
+        }
+        
+        // Legacy format: PROD/VERS/USER/LKEY without NAME/PASS
+        // Extract username from USER format: /PC/username or /PC/NFS-CONSOLE-2005
+        let username = user || 'Unknown';
+        if (user.startsWith('/PC/')) {
+            username = user.substring(4);
+        } else if (user.includes('/')) {
+            username = user.split('/').pop();
+        }
+        
+        // Try to get or create user based on username
+        let dbUser = database.getUser(username);
+        if (!dbUser) {
+            // Auto-create user with default password (empty or username)
+            const result = database.createUser(username, username, '');
+            if (result.success) {
+                dbUser = result.user;
+                log.info(`[${client.id}] Auto-created user from USER field: ${username}`);
+            }
+        }
+        
+        // Create session
+        const session = database.createSession(dbUser?.id || Date.now(), {
+            addr: client.address,
+            port: client.port,
+            name: username,
+        });
+        
+        client.user = dbUser || { name: username, id: Date.now() };
+        client.session = session;
+        client.authenticated = true;
+        
+        // Response observed from NFSOR: TITL=EA MESSENGER
+        const response = 'TITL=EA MESSENGER\n';
+        this._sendPacket(client, 'AUTH', 0, response);
+    }
+    
+    _generateLKey() {
+        // Generate session key (32 hex chars)
+        return [...Array(32)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
+    }
+
+    _handleEPGT(client, params) {
+        // Request: LRSC=PC\nID=4
+        // Response: ENAB=t\nID=4\nADDR=127.0.0.1
+        
+        const lrsc = params.LRSC || 'PC';
+        const id = params.ID || '0';
+        
+        log.info(`[${client.id}] EPGT: lrsc=${lrsc} id=${id}`);
+        
+        const response = [
+            'ENAB=t',
+            `ID=${id}`,
+            `ADDR=${client.address}`,
+        ].join('\n') + '\n';
+        
+        this._sendPacket(client, 'EPGT', 0, response);
+    }
+
+    _handleRGET(client, params) {
+        // Request: LRSC=PC\nLIST=B\nPRES=Y\nPEND=Y\nID=1
+        // Response: SIZE=0\nID=1 (as RGET or ROST)
+        
+        const list = params.LIST || 'B';
+        const id = params.ID || '0';
+        
+        log.info(`[${client.id}] RGET: list=${list} id=${id}`);
+        
+        // For now, return empty roster
+        const response = [
+            'SIZE=0',
+            `ID=${id}`,
+        ].join('\n') + '\n';
+        
+        // NFSOR returns RGET for first request, ROST for second
+        const responseCmd = list === 'I' ? 'ROST' : 'RGET';
+        this._sendPacket(client, responseCmd, 0, response);
+    }
+
+    _handlePSET(client, params) {
+        // Request: SHOW=CHAT\nSTAT=EX%3d0%0aP%3dnfs5%0a\nPROD="..."
+        // Response: (empty, just status 0)
+        
+        const show = params.SHOW || 'CHAT';
+        const stat = params.STAT || '';
+        
+        log.info(`[${client.id}] PSET: show=${show}`);
+        
+        client.presence = show;
+        
+        // NFSOR responds with empty PSET
+        this._sendPacket(client, 'PSET', 0, '');
+    }
+
+    _handleDisc(client, params) {
+        log.info(`[${client.id}] DISC: client disconnecting`);
+        
+        // Acknowledge and close
+        this._sendPacket(client, 'DISC', 0, '');
+        
+        setTimeout(() => {
+            client.socket?.end();
+        }, 100);
+    }
+
+    _handlePing(client, params) {
+        log.debug(`[${client.id}] PING`);
+        this._sendPacket(client, 'PING', 0, '');
+    }
+
+    _handlePADD(client, params) {
+        // Add user to buddy/presence list (for in-game presence tracking)
+        // Request: LRSC=PC\nUSER=<persona>
+        // Response: LRSC=PC\nUSER=<persona> (echo back)
+        const lrsc = params.LRSC || 'PC';
+        const user = params.USER || '';
+        
+        log.info(`[${client.id}] PADD: Adding ${user} to presence list`);
+        
+        // Store in client's buddy tracking (for presence updates)
+        if (!client.buddyList) {
+            client.buddyList = [];
+        }
+        if (!client.buddyList.includes(user)) {
+            client.buddyList.push(user);
+        }
+        
+        // Echo back
+        const response = `LRSC=${lrsc}\nUSER=${user}\n`;
+        this._sendPacket(client, 'PADD', 0, response);
+    }
+    
+    _handlePGET(client, params) {
+        // Get presence/status of user
+        // This is triggered when looking up a player (e.g., someone joins your game)
+        // Response from NFSOR:
+        // EXTR=NFS-CONSOLE-2005
+        // STAT=EX%3d0%0aP%3dnfs5%0a
+        // PROD=is playing Underground 2
+        // TITL=Need for Speed Underground 2 [PC]
+        // SHOW=AWAY
+        // USER=<persona>
+        // ATTR=D
+        const user = params.USER || '';
+        
+        log.info(`[${client.id}] PGET: Getting presence for ${user}`);
+        
+        // Find the user's client
+        let targetClient = null;
+        for (const c of this.clients.values()) {
+            if (c.persona === user && c.authenticated) {
+                targetClient = c;
+                break;
+            }
+        }
+        
+        // Build presence response
+        const show = targetClient?.presence || 'AWAY';  // CHAT, AWAY, PASS, etc.
+        
+        const response = [
+            'EXTR=NFS-CONSOLE-2005',
+            'STAT=EX%3d0%0aP%3dnfs5%0a',
+            'PROD=is playing Underground 2',
+            'TITL=Need for Speed Underground 2 [PC]',
+            `SHOW=${show}`,
+            `USER=${user}`,
+            'ATTR=D',  // D = default? 
+        ].join('\n') + '\n';
+        
+        this._sendPacket(client, 'PGET', 0, response);
+    }
+
+    // ============================================================================
+    // Protocol Helpers
+    // ============================================================================
+
+    _intToCmd(val) {
+        return String.fromCharCode(
+            (val >> 24) & 0xFF,
+            (val >> 16) & 0xFF,
+            (val >> 8) & 0xFF,
+            val & 0xFF
+        );
+    }
+
+    _cmdToInt(cmd) {
+        if (typeof cmd !== 'string' || cmd.length < 4) return 0;
+        return (cmd.charCodeAt(0) << 24) |
+               (cmd.charCodeAt(1) << 16) |
+               (cmd.charCodeAt(2) << 8) |
+               cmd.charCodeAt(3);
+    }
+
+    _parsePayload(payload) {
+        const result = {};
+        if (!payload) return result;
+        
+        // Format: KEY=VALUE\nKEY2=VALUE2\n\0
+        const lines = payload.split('\n');
+        for (const line of lines) {
+            const eqIdx = line.indexOf('=');
+            if (eqIdx > 0) {
+                const key = line.substring(0, eqIdx).trim();
+                let value = line.substring(eqIdx + 1).trim();
+                // Remove quotes
+                if (value.startsWith('"') && value.endsWith('"')) {
+                    value = value.slice(1, -1);
+                }
+                result[key] = value;
+            }
+        }
+        return result;
+    }
+
+    _sendPacket(client, cmd, status, payload) {
+        // EA Protocol: [4-byte CMD ASCII][4-byte STATUS BE][4-byte LENGTH BE][PAYLOAD + \0]
+        const payloadStr = payload + '\0';  // Null terminate
+        const payloadBuf = Buffer.from(payloadStr, 'utf8');
+        const totalLength = 12 + payloadBuf.length;
+        
+        const packet = Buffer.alloc(totalLength);
+        
+        // Write command as 4 ASCII characters
+        packet.write(cmd.padEnd(4, '\0').substring(0, 4), 0, 4, 'ascii');
+        // Write status as big-endian int32
+        packet.writeInt32BE(status, 4);
+        // Write total length as big-endian uint32
+        packet.writeUInt32BE(totalLength, 8);
+        // Copy payload
+        payloadBuf.copy(packet, 12);
+        
+        try {
+            if (client.socket && !client.socket.destroyed) {
+                client.socket.write(packet);
+                log.info(`[${client.id}] >>> CMD: ${cmd} status=${status} len=${totalLength}`);
+                if (payload.length > 0) {
+                    log.info(`[${client.id}]     payload: ${payload.replace(/\n/g, ' | ')}`);
+                }
+            }
+        } catch (err) {
+            log.error(`[${client.id}] Send error: ${err.message}`);
+        }
+    }
+
+    // ============================================================================
+    // Game Management Functions
+    // ============================================================================
+
+    _handleGameSearch(client, fields) {
+        // Game search - return list of active games
+        const start = parseInt(fields.START) || 0;
+        const count = parseInt(fields.COUNT) || 20;
+        const custFlags = parseInt(fields.CUSTFLAGS) || 0;
+        const custMask = parseInt(fields.CUSTMASK) || 0;
+        
+        log.info(`[${client.id}] GSEA: start=${start}, count=${count}, flags=${custFlags}`);
+        
+        // Get matching games
+        const allGames = Array.from(this.games.values());
+        const matchingGames = allGames.slice(start, start + count);
+        
+        // Send gsea response with count
+        this._sendFeslResponse(client, 'gsea', {
+            'COUNT': String(matchingGames.length),
+        });
+        
+        // Send +gam push for each game
+        for (const game of matchingGames) {
+            this._sendGameInfo(client, game, '+gam');
+        }
+    }
+    
+    _handleGameGet(client, fields) {
+        const gameName = fields.NAME || '';
+        const game = this._findGameByName(gameName);
+        
+        if (game) {
+            this._sendGameInfo(client, game, 'gget');
+        } else {
+            this._sendFeslResponse(client, 'gget', { 'COUNT': '0' });
+        }
+    }
+    
+    _handleGameJoin(client, fields) {
+        const gameName = fields.NAME || '';
+        const game = this._findGameByName(gameName);
+        
+        log.info(`[${client.id}] GJOI: Joining game '${gameName}'`);
+        
+        if (!game) {
+            log.warn(`[${client.id}] GJOI: Game '${gameName}' not found`);
+            this._sendFeslResponseWithStatus(client, 'gjoi', -1, { 'ERR': 'notfound' });
+            return;
+        }
+        
+        // Check if game is full
+        if (game.players.length >= game.maxSize) {
+            log.warn(`[${client.id}] GJOI: Game '${gameName}' is full`);
+            this._sendFeslResponseWithStatus(client, 'gjoi', -1, { 'ERR': 'full' });
+            return;
+        }
+        
+        // Add player to game
+        const playerIndex = game.players.length;
+        const playerInfo = {
+            id: client.id,
+            opid: client.id + 2485,  // Generate OPID like NFSOR
+            name: client.persona || 'Player',
+            addr: client.address,  // External IP (what server sees)
+            laddr: client.reportedAddr || client.address,  // Local IP from addr command
+            udpPort: parseInt(client.reportedPort) || 0,  // UDP port for P2P/relay
+            flags: 0,  // 0 = not ready, 134217728 = ready
+            part: 0,
+            partSize: 4,
+        };
+        game.players.push(playerInfo);
+        client.currentGame = game;
+        client.gamePlayerIndex = playerIndex;
+        
+        log.info(`[${client.id}] GJOI: Player ${playerInfo.name} joined as player #${playerIndex}`);
+        log.info(`[${client.id}] GJOI: addr=${playerInfo.addr}, laddr=${playerInfo.laddr}, udpPort=${playerInfo.udpPort}`);
+        
+        // Send gjoi response with full game info to joining player
+        this._sendGameInfo(client, game, 'gjoi');
+        
+        // Send +who with player stats (including car data X=)
+        this._sendPlayerWho(client, playerInfo, game);
+        
+        // Send +mgm (game update) to ALL players in game (including new joiner)
+        // This notifies everyone about the new player
+        setTimeout(() => {
+            this._broadcastToGame(game, '+mgm');
+        }, 100);
+        
+        // Broadcast stats update
+        setTimeout(() => {
+            this._broadcastStatsUpdate();
+        }, 200);
+    }
+    
+    _handleGameSet(client, fields) {
+        // Player sets their flags (ready status)
+        // CLIENT: NAME=069.usersssss, USERFLAGS=134217728 (ready)
+        // SERVER: Full game info via gset response, then +mgm to everyone
+        const gameName = fields.NAME || '';
+        const userFlags = parseInt(fields.USERFLAGS) || 0;
+        const game = client.currentGame;
+        
+        log.info(`[${client.id}] GSET: game='${gameName}', flags=${userFlags} (${userFlags === 134217728 ? 'READY' : 'NOT READY'})`);
+        
+        if (!game) {
+            log.warn(`[${client.id}] GSET: Not in a game`);
+            this._sendFeslResponse(client, 'gset', {});
+            return;
+        }
+        
+        // Find this player in game and update their flags
+        let playerFound = false;
+        for (let i = 0; i < game.players.length; i++) {
+            if (game.players[i].id === client.id) {
+                game.players[i].flags = userFlags;
+                client.gamePlayerIndex = i;
+                playerFound = true;
+                log.info(`[${client.id}] GSET: Updated player ${i} flags to ${userFlags}`);
+                break;
+            }
+        }
+        
+        if (!playerFound) {
+            log.warn(`[${client.id}] GSET: Player not found in game`);
+        }
+        
+        // Send gset response with updated game info to the requester
+        this._sendGameInfo(client, game, 'gset');
+        
+        // Broadcast +mgm to ALL players in game with updated info
+        setTimeout(() => {
+            this._broadcastToGame(game, '+mgm');
+        }, 50);
+        
+        // Check if all players ready (but don't auto-start - wait for gsta)
+        this._checkGameStart(game);
+    }
+    
+    _handleGameLeave(client, fields) {
+        const game = client.currentGame;
+        
+        log.info(`[${client.id}] GLEA: Leaving game`);
+        
+        if (game) {
+            // Remove player from game
+            game.players = game.players.filter(p => p.id !== client.id);
+            
+            if (game.players.length === 0) {
+                // Delete empty game
+                this.games.delete(game.id);
+                log.info(`[${client.id}] Game ${game.name} deleted (empty)`);
+            } else {
+                // Broadcast update
+                this._broadcastToGame(game, '+mgm');
+            }
+        }
+        
+        client.currentGame = null;
+        this._sendFeslResponse(client, 'glea', {});
+    }
+    
+    _handleGameCreate(client, fields) {
+        // Create a new game
+        // CLIENT sends: NAME=069.usersssss, MAXSIZE=4, MINSIZE=2, CUSTFLAGS=67109107, SYSFLAGS=0, PARAMS=TRACK%3d4014%0aDIR%3d0%0aLAPS%3d3
+        const gameId = this.nextGameId++;
+        
+        // Parse the NAME field - client may send pre-formatted name like "069.usersssss"
+        // or we generate it from gameId + persona
+        let gameName = fields.NAME;
+        if (!gameName) {
+            gameName = `${String(gameId).padStart(3, '0')}.${client.persona || 'Player'}`;
+        }
+        
+        const game = {
+            id: gameId,
+            name: gameName,
+            host: client.persona || 'Player',
+            hostId: client.id,
+            custFlags: parseInt(fields.CUSTFLAGS) || 67109107,  // From capture
+            sysFlags: parseInt(fields.SYSFLAGS) || 0,
+            minSize: parseInt(fields.MINSIZE) || 2,
+            maxSize: parseInt(fields.MAXSIZE) || 4,
+            numPart: 1,  // Always 1 in NFSU2
+            params: fields.PARAMS || 'TRACK%3d4014%0aDIR%3d0%0aLAPS%3d3',
+            room: 0,
+            evid: 0,
+            evgid: 0,
+            players: [],
+        };
+        
+        // Add host as first player
+        // Use real external address + local address
+        const hostInfo = {
+            id: client.id,
+            opid: client.id + 2485,  // Generate OPID like NFSOR
+            name: client.persona || 'Player',
+            addr: client.address,  // External IP (what server sees)
+            laddr: client.reportedAddr || client.address,  // Local IP (what client reports)
+            udpPort: parseInt(client.reportedPort) || 0,  // UDP port for P2P/relay
+            flags: 0,  // 0 = not ready, 134217728 = ready
+            part: 0,
+            partSize: 4,
+        };
+        game.players.push(hostInfo);
+        
+        this.games.set(gameId, game);
+        client.currentGame = game;
+        client.gamePlayerIndex = 0;
+        
+        log.info(`[${client.id}] GCRE: Created game '${gameName}' (ID: ${gameId})`);
+        log.info(`[${client.id}] GCRE: custFlags=${game.custFlags}, params=${game.params}`);
+        
+        // Send gcre response with full game info
+        this._sendGameInfo(client, game, 'gcre');
+        
+        // Send +who with player stats (client needs X= for car data)
+        this._sendPlayerWho(client, hostInfo, game);
+        
+        // Send +mgm game management update (like NFSOR does after gcre)
+        setTimeout(() => {
+            this._sendGameInfo(client, game, '+mgm');
+        }, 100);
+        
+        // Broadcast stats update to everyone
+        setTimeout(() => {
+            this._broadcastStatsUpdate();
+        }, 200);
+    }
+    
+    _handleAuxi(client, fields) {
+        // Store car customization data
+        const text = fields.TEXT || '';
+        client.auxiData = text;
+        
+        log.info(`[${client.id}] AUXI: Received car data (${text.length} chars)`);
+        
+        // Echo back empty response
+        this._sendFeslResponse(client, 'auxi', {});
+    }
+    
+    _findGameByName(name) {
+        for (const game of this.games.values()) {
+            if (game.name === name) {
+                return game;
+            }
+        }
+        return null;
+    }
+    
+    _sendGameInfo(client, game, cmd) {
+        // Build game info response (matches NFSOR format)
+        const info = {
+            'HOST': game.host,
+            'NAME': game.name,
+            'IDENT': String(game.id),
+            'CUSTFLAGS': String(game.custFlags),
+            'SYSFLAGS': String(game.sysFlags),
+            'MINSIZE': String(game.minSize),
+            'MAXSIZE': String(game.maxSize),
+            'NUMPART': String(game.numPart),
+            'COUNT': String(game.players.length),
+            'PARAMS': game.params,
+            'ROOM': String(game.room),
+            'EVID': String(game.evid),
+            'EVGID': String(game.evgid),
+        };
+        
+        // Add player info (OPID0, OPPO0, ADDR0, LADDR0, etc for each player)
+        for (let i = 0; i < game.players.length; i++) {
+            const p = game.players[i];
+            info[`OPID${i}`] = String(p.opid);
+            info[`OPPO${i}`] = p.name;
+            info[`ADDR${i}`] = p.addr;
+            info[`LADDR${i}`] = p.laddr;
+            info[`MADDR${i}`] = '';  // Media address (empty)
+            info[`OPFLAG${i}`] = String(p.flags);
+            info[`OPPART${i}`] = String(p.part);
+            info[`PARTSIZE${i}`] = '4';
+        }
+        
+        this._sendFeslResponse(client, cmd, info);
+    }
+    
+    _sendPlayerWho(client, playerInfo, game) {
+        // Send +who with player statistics
+        // This contains player info including car customization data in X=
+        // From captured NFSOR traffic:
+        // A=195.3.223.202 (external IP)
+        // C=20043 (port?)
+        // G=833 (game ID, or 0 if not in game)
+        // I=2594 (OPID - unique player ID)
+        // ...stats...
+        // X=C%3d281DCV74j/4AAA... (car customization data, URL encoded)
+        
+        // Get the client object for this player to get their auxiData
+        const playerClient = this.clients.get(playerInfo.id);
+        const auxiData = playerClient?.auxiData || 'null';
+        const userName = playerClient?.user?.name || playerInfo.name;
+        // UDP port from 'addr' command - used for P2P relay
+        const udpPort = playerClient?.reportedPort || '3658';
+        
+        this._sendFeslResponse(client, '+who', {
+            'A': playerInfo.addr,       // External IP address
+            'C': udpPort,               // UDP port for P2P (from addr command)
+            'G': String(game.id),       // Current game ID
+            'I': String(playerInfo.opid), // Unique player ID (OPID)
+            'CL': '423',                // Career Level?
+            'LV': '354',                // Level?
+            'M': userName,              // Account name
+            'N': playerInfo.name,       // Persona name
+            'HW': '5765',               // Hardware ID?
+            'P': '100',                 // Points?
+            'WI': '10323',              // Wins?
+            'R': '11432',               // Races?
+            'S': 'online',              // Status/Server
+            'AT': '1423',               // ?
+            'MA': '7876',               // ?
+            'LA': playerInfo.laddr || playerInfo.addr,  // Local address
+            'MD': '4654',               // ?
+            'X': auxiData,              // Car customization data (important!)
+            'WT': '8987',               // ?
+            'RP': '676',                // Rep points?
+            'US': '2',                  // User status?
+        });
+    }
+    
+    _broadcastToGame(game, cmd) {
+        // Send game update to all players
+        for (const player of game.players) {
+            const clientObj = this.clients.get(player.id);
+            if (clientObj) {
+                this._sendGameInfo(clientObj, game, cmd);
+            }
+        }
+    }
+    
+    _checkGameStart(game) {
+        // Check if all players are ready (flag 134217728)
+        const allReady = game.players.length >= game.minSize && 
+                         game.players.every(p => p.flags === 134217728);
+        
+        if (allReady) {
+            log.info(`Game ${game.name}: All players ready, waiting for host 'gsta' command...`);
+            game.allReady = true;
+            // Don't auto-start! Wait for host to send 'gsta' command
+        }
+    }
+    
+    _handleOnlineCheck(client, fields) {
+        // Check if persona is online
+        // CLIENT: PERS=<persona_name>
+        // SERVER: I=0 (not online) or I=<id> (online)
+        const persona = fields.PERS || '';
+        
+        log.info(`[${client.id}] ONLN: Checking if '${persona}' is online`);
+        
+        // Search for online client with this persona
+        let onlineId = 0;
+        for (const [id, c] of this.clients.entries()) {
+            if (c.persona === persona && c.authenticated) {
+                onlineId = c.id + 2485;  // OPID format
+                break;
+            }
+        }
+        
+        this._sendFeslResponse(client, 'onln', {
+            'I': String(onlineId),
+        });
+    }
+    
+    _handleGameStart(client, fields) {
+        // Game start - host signals to start the race
+        // CLIENT: NAME=069.usersssss
+        // SERVER: empty response, then +mgm, then +ses to all players
+        const gameName = fields.NAME || '';
+        const game = client.currentGame;
+        
+        log.info(`[${client.id}] GSTA: Host starting game '${gameName}'`);
+        
+        // Send empty gsta response first
+        this._sendFeslResponse(client, 'gsta', {});
+        
+        if (!game) {
+            log.warn(`[${client.id}] GSTA: Not in a game`);
+            return;
+        }
+        
+        // Verify this is the host
+        if (game.hostId !== client.id) {
+            log.warn(`[${client.id}] GSTA: Not the host`);
+            return;
+        }
+        
+        // Send +mgm update to all players
+        this._broadcastToGame(game, '+mgm');
+        
+        // Now start the game - send +ses to all players
+        log.info(`Game ${game.name}: Starting game via gsta!`);
+        
+        // Generate random seed for game sync
+        const seed = Math.floor(Math.random() * 10000000);
+        
+        // Build +ses (session start) packet
+        const sesInfo = {
+            'HOST': game.host,
+            'NAME': game.name,
+            'IDENT': String(game.id),
+            'SEED': String(seed),
+            'SELF': '',  // Will be set per-player
+            'CUSTFLAGS': String(game.custFlags),
+            'SYSFLAGS': String(game.sysFlags),
+            'MINSIZE': String(game.minSize),
+            'MAXSIZE': String(game.maxSize),
+            'NUMPART': String(game.numPart),
+            'COUNT': String(game.players.length),
+            'PARAMS': game.params,
+            'ROOM': String(game.room),
+            'EVID': String(game.evid),
+            'EVGID': String(game.evgid),
+        };
+        
+        // In +ses, ADDRx contains the IP where each player can be reached for P2P
+        // For relay mode: use relay server IP (all clients connect through relay)
+        // For direct P2P: use each player's external IP
+        // LADDRx contains local IPs for LAN detection (same subnet = LAN game)
+        //
+        // Since we're using relay, all players should have the SAME ADDR (relay server)
+        // The relay server will route packets based on source port
+        const relayIP = config.server.publicIP;  // Relay server public IP from config
+        
+        for (let i = 0; i < game.players.length; i++) {
+            const p = game.players[i];
+            const clientObj = this.clients.get(p.id);
+            
+            sesInfo[`OPID${i}`] = String(p.opid);
+            sesInfo[`OPPO${i}`] = p.name;
+            // Use relay server IP so all UDP goes through relay
+            sesInfo[`ADDR${i}`] = relayIP;
+            sesInfo[`LADDR${i}`] = p.laddr || relayIP;
+            sesInfo[`MADDR${i}`] = '';
+            sesInfo[`OPFLAG${i}`] = String(p.flags);
+            sesInfo[`OPPART${i}`] = String(p.part);
+            sesInfo[`PARTSIZE${i}`] = '4';
+            
+            log.info(`+ses player ${i}: ${p.name} ADDR=${relayIP} LADDR=${p.laddr} udpPort=${clientObj?.reportedPort || 'N/A'}`);
+        }
+        
+        // Register game in UDP relay server (so it knows which clients belong together)
+        if (this.udpServer) {
+            // Build list of expected UDP endpoints (IP:reportedPort for each player)
+            const udpEndpoints = game.players.map(p => {
+                const clientObj = this.clients.get(p.id);
+                const udpPort = clientObj?.reportedPort || 0;
+                return `${p.addr}:${udpPort}`;
+            }).filter(addr => !addr.includes(':0'));
+            
+            if (udpEndpoints.length > 0) {
+                this.udpServer.registerGame(game.id, udpEndpoints);
+                log.info(`Game ${game.id}: Registered ${udpEndpoints.length} UDP endpoints`);
+            }
+        }
+        
+        // Log full +ses content for debugging
+        log.info(`+ses content: COUNT=${game.players.length}`);
+        for (let i = 0; i < game.players.length; i++) {
+            log.info(`  OPPO${i}=${sesInfo[`OPPO${i}`]} ADDR${i}=${sesInfo[`ADDR${i}`]} OPID${i}=${sesInfo[`OPID${i}`]}`);
+        }
+        
+        // Send +ses to each player with their name in SELF
+        for (const player of game.players) {
+            const clientObj = this.clients.get(player.id);
+            if (clientObj) {
+                sesInfo['SELF'] = player.name;
+                this._sendFeslResponse(clientObj, '+ses', sesInfo);
+                log.info(`[${clientObj.id}] >>> +ses sent to ${player.name} (SELF=${player.name})`);
+            }
+        }
+    }
+
+    _onClose(client) {
+        log.info(`[${client.id}] Connection closed`);
+        
+        // Leave any game
+        if (client.currentGame) {
+            const game = client.currentGame;
+            game.players = game.players.filter(p => p.id !== client.id);
+            if (game.players.length === 0) {
+                this.games.delete(game.id);
+            } else {
+                this._broadcastToGame(game, '+mgm');
+            }
+        }
+        
+        this.clients.delete(client.id);
+    }
+
+    getClientCount() {
+        return this.clients.size;
+    }
+
+    getClients() {
+        return Array.from(this.clients.values());
+    }
+
+    broadcast(cmd, status, payload) {
+        for (const client of this.clients.values()) {
+            this._sendPacket(client, cmd, status, payload);
+        }
+    }
+}
+
+export default TCPServer;
