@@ -1,0 +1,10 @@
+^C:\USERS\123\DESKTOP\NFS\NFSOR_CUSTOM\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SC:/Users/123/Desktop/NFS/NFSOR_Custom -BC:/Users/123/Desktop/NFS/NFSOR_Custom/build --check-stamp-file C:/Users/123/Desktop/NFS/NFSOR_Custom/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
