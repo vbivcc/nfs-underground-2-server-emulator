@@ -1,0 +1,122 @@
+{
+  "admin": {
+    "id": 1769346254217,
+    "name": "admin",
+    "nameLower": "admin",
+    "password": "$b86488f96fd2",
+    "email": "fdhjskfsdjk@mail.ru",
+    "created": "2026-01-25T13:04:14.217Z",
+    "lastLogin": "2026-01-25T14:25:38.372Z",
+    "personas": [
+      "admin",
+      "debil",
+      "debilll"
+    ],
+    "stats": {
+      "wins": 0,
+      "losses": 0,
+      "races": 0,
+      "rep": 0,
+      "level": 1
+    }
+  },
+  "admin123123123": {
+    "id": 1769365466473,
+    "name": "admin123123123",
+    "nameLower": "admin123123123",
+    "password": "$b86488f96fd22dccce",
+    "email": "",
+    "created": "2026-01-25T18:24:26.473Z",
+    "lastLogin": null,
+    "personas": [
+      "admin123123123"
+    ],
+    "stats": {
+      "wins": 0,
+      "losses": 0,
+      "races": 0,
+      "rep": 0,
+      "level": 1
+    }
+  },
+  "": {
+    "id": 1769365467550,
+    "name": "",
+    "nameLower": "",
+    "password": "",
+    "email": "",
+    "created": "2026-01-25T18:24:27.550Z",
+    "lastLogin": null,
+    "personas": [
+      ""
+    ],
+    "stats": {
+      "wins": 0,
+      "losses": 0,
+      "races": 0,
+      "rep": 0,
+      "level": 1
+    }
+  },
+  "test": {
+    "id": 1769366651568,
+    "name": "test",
+    "nameLower": "test",
+    "password": "$b9648e996dc0",
+    "email": "fhahjdfjg@mail.ru",
+    "created": "2026-01-25T18:44:11.568Z",
+    "lastLogin": "2026-01-25T18:44:11.608Z",
+    "personas": [
+      "test"
+    ],
+    "stats": {
+      "wins": 0,
+      "losses": 0,
+      "races": 0,
+      "rep": 0,
+      "level": 1
+    }
+  },
+  "user111": {
+    "id": 1769368250376,
+    "name": "user111",
+    "nameLower": "user111",
+    "password": "$ebfa7d555d4a",
+    "mail": "fdjkshfjdskh@mail.ru",
+    "email": "fdjkshfjdskh@mail.ru",
+    "born": "19800101",
+    "created": "2026-01-25T19:10:50.376Z",
+    "lastLogin": "2026-01-25T19:38:47.304Z",
+    "personas": [
+      "124124"
+    ],
+    "stats": {
+      "wins": 0,
+      "losses": 0,
+      "races": 0,
+      "rep": 0,
+      "level": 1
+    }
+  },
+  "user14": {
+    "id": 1769368361377,
+    "name": "user14",
+    "nameLower": "user14",
+    "password": "$be5742ff5965",
+    "mail": "fdsjkfjdshjkf@mail.ru",
+    "email": "fdsjkfjdshjkf@mail.ru",
+    "born": "19800101",
+    "created": "2026-01-25T19:12:41.377Z",
+    "lastLogin": "2026-01-25T19:38:50.795Z",
+    "personas": [
+      "hui"
+    ],
+    "stats": {
+      "wins": 0,
+      "losses": 0,
+      "races": 0,
+      "rep": 0,
+      "level": 1
+    }
+  }
+}
